@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import json
 import os
 import pickle
@@ -9,23 +11,9 @@ import requests
 from errors import CacheError, MetadataError, NetworkError
 from resolver import resolve_version
 
-# 0. configuration setup
-# 1. connection pooling
-# 2. get packages list first
-# 3. download their metadata
-# 3.5 resolve version
-# 4. figure out the dependencies
-# repeat 3 and 4 for each package
-# 5. download the packages
-# 6. install the packages
-# 7. symlink dependencies of each package to the node_modules directory's package directory
 
-
-# 0. configuration setup
-
-
+# 0. Configuration setup
 CONFIG = {"registry": "https://registry.npmjs.org/"}
-
 METADATA_DOWNLOADED_PACKAGES = set()
 TARBALL_DOWNLOADED_PACKAGES = set()
 
@@ -48,19 +36,18 @@ if not CONFIG["registry"].endswith("/"):
     CONFIG["registry"] += "/"
 
 
-# Setup store and cache
-STORE_DIR = Path.cwd() / ".yap_store"  # TODO: update this to home() instead of cwd()
-STORE_DIR.mkdir(parents=True, exist_ok=True)
+# Setup store and cache directories
+STORE_DIR = Path.cwd() / ".yap_store"
 CACHE_DIR = STORE_DIR / ".yap_cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NODE_MODULES_DIR = Path.cwd() / "node_modules"
-NODE_MODULES_DIR.mkdir(parents=True, exist_ok=True)
+
+for path in [STORE_DIR, CACHE_DIR, NODE_MODULES_DIR]:
+    path.mkdir(parents=True, exist_ok=True)
 
 
+# Cache management
 def set_to_metadata_cache(name: str, contents: any):
-    if "/" in name:
-        name = name.replace("/", "_")
-    cache_file = CACHE_DIR / name
+    cache_file = CACHE_DIR / name.replace("/", "_")
     try:
         with cache_file.open("wb") as f:
             pickle.dump(contents, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -69,28 +56,28 @@ def set_to_metadata_cache(name: str, contents: any):
 
 
 def get_from_metadata_cache(name: str):
-    if "/" in name:
-        name = name.replace("/", "_")
-    cache_file = CACHE_DIR / name
-    if not cache_file.exists():
-        return None
-    try:
-        with cache_file.open("rb") as f:
-            return pickle.load(f)
-    except Exception as e:
-        raise CacheError(f"Error reading from cache for '{name}': {e}")
+    cache_file = CACHE_DIR / name.replace("/", "_")
+    if cache_file.exists():
+        try:
+            with cache_file.open("rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            raise CacheError(f"Error reading from cache for '{name}': {e}")
+    return None
 
 
+# HTTP session
 session = requests.Session()
 if "authToken" in CONFIG:
     session.headers["Authorization"] = f"Bearer {CONFIG['authToken']}"
 
 
-def fetch_package_metadata(name: str) -> dict[str, any]:
-    cached_package_metadata = get_from_metadata_cache(name)
-    if cached_package_metadata is not None:
-        return cached_package_metadata
-    package_url = f"{CONFIG["registry"]}{name}"
+def fetch_package_metadata(name: str) -> dict:
+    cached_metadata = get_from_metadata_cache(name)
+    if cached_metadata:
+        return cached_metadata
+
+    package_url = f"{CONFIG['registry']}{name}"
     session.headers["Accept"] = (
         "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*"
     )
@@ -99,6 +86,7 @@ def fetch_package_metadata(name: str) -> dict[str, any]:
         raise NetworkError(
             f"Failed to fetch {package_url}: {response.status_code} {response.reason}"
         )
+
     try:
         package_details = response.json()
         set_to_metadata_cache(name, package_details)
@@ -107,89 +95,96 @@ def fetch_package_metadata(name: str) -> dict[str, any]:
         raise MetadataError(f"Error parsing JSON from {package_url}: {e}")
 
 
-# 2. get packages list first from package.json
-package_json = Path.cwd() / "package.json"
-if not package_json.exists():
-    print("package.json not found")
-    exit(1)
+# 1. Check for existing lockfile
+lock_file = Path.cwd() / "yap.lock"
+if lock_file.exists():
+    print("Lockfile found, skipping resolution")
+    with lock_file.open("rb") as f:
+        lock_file_details = pickle.load(f)
+else:
+    lock_file_details = []
+    package_json = Path.cwd() / "package.json"
+    if not package_json.exists():
+        print("package.json not found")
+        exit(1)
 
+    # Load package.json dependencies
+    with package_json.open("r") as f:
+        data = json.load(f)
+        dependencies = {
+            **data.get("dependencies", {}),
+            **data.get("devDependencies", {}),
+            **data.get("peerDependencies", {}),
+        }
 
-dependencies = {}
-lock_file_details = []
-with open(package_json, "r") as f:
-    data = json.load(f)
-    dependencies = data.get("dependencies", {})
-    dependencies.update(data.get("devDependencies", {}))
-    dependencies.update(data.get("peerDependencies", {}))
+    # Resolve dependencies and download metadata
+    def resolve_dependency_and_queue_urls(dependencies):
+        for package_name, version in dependencies.items():
+            if package_name in METADATA_DOWNLOADED_PACKAGES:
+                continue
+            print(f"RESOLVING: {package_name} {version}")
+            package_metadata = fetch_package_metadata(package_name)
+            METADATA_DOWNLOADED_PACKAGES.add(package_name)
 
+            # 3.5 Resolve version
+            if version.startswith(("git+", "npm:", "git:")):
+                continue
+            available_versions = package_metadata["versions"].keys()
+            resolved_version = resolve_version(version, available_versions)
+            if not resolved_version:
+                raise MetadataError(
+                    f"Could not resolve version for {package_name} {version}"
+                )
+            package_metadata = package_metadata["versions"][resolved_version]
 
-# 3. download their metadata
-def resolve_dependency_and_queue_urls(dependencies):
-    for package_name, version in dependencies.items():
-        if package_name in METADATA_DOWNLOADED_PACKAGES:
-            continue
-        print("RESOLVING: ", package_name, version)
-        package_metadata = fetch_package_metadata(package_name)
-        METADATA_DOWNLOADED_PACKAGES.add(package_name)
+            # 4. Resolve dependencies recursively
+            resolve_dependency_and_queue_urls(package_metadata.get("dependencies", {}))
 
-        # 3.5 resolve version
-        # check if the version starts with something funky like git+ or npm:
-        if version.startswith(("git+", "npm:", "git:")):
-            continue
-        available_versions = list(package_metadata["versions"].keys())
-        resolved_version = resolve_version(version, available_versions)
-        if resolved_version is None:
-            raise MetadataError(
-                f"Could not resolve version for {package_name} {version}"
+            tarball_url = package_metadata["dist"]["tarball"]
+            lock_file_details.append(
+                {
+                    "url": tarball_url,
+                    "name": package_name,
+                    "version": resolved_version,
+                    "dependencies": package_metadata.get("dependencies", {}),
+                }
             )
-        package_metadata = package_metadata["versions"][resolved_version]
 
-        # 4. figure out the dependencies
-        resolve_dependency_and_queue_urls(package_metadata.get("dependencies", {}))
+    resolve_dependency_and_queue_urls(dependencies)
 
-        tarball_url = package_metadata["dist"]["tarball"]
-        lock_file_details.append(
-            {
-                "url": tarball_url,
-                "name": package_name,
-                "version": resolved_version,
-                "dependencies": package_metadata.get("dependencies", {}),
-            }
-        )
+    # Save lockfile
+    with lock_file.open("wb") as f:
+        pickle.dump(lock_file_details, f)
 
 
-resolve_dependency_and_queue_urls(dependencies)
-
-# 5. download the packages
-for package in lock_file_details:
-    if package["name"] in TARBALL_DOWNLOADED_PACKAGES:
-        continue
-
+# 5. Download and extract packages
+def download_and_extract_package(package):
     tarball_path = STORE_DIR / f"{package['name'].replace('/', '_')}.tgz"
     if (STORE_DIR / package["name"]).exists():
         print("Package already exists", package["name"])
-        continue
+        return
 
-    print("Downloading", package["name"])
+    print(f"Downloading {package['name']}")
     response = session.get(package["url"])
-
     if response.status_code != 200:
         raise NetworkError(
             f"Failed to fetch {package['url']}: {response.status_code} {response.reason}"
         )
 
-    with open(tarball_path, "wb") as f:
+    with tarball_path.open("wb") as f:
         f.write(response.content)
 
     with tarfile.open(tarball_path, "r:gz") as tar:
-        for member in tar.getmembers():
-            if member.name.startswith("package/"):
-                member.name = member.name[len("package/") :]
-                tar.extract(member, path=STORE_DIR / package["name"])
+        tar.extractall(path=STORE_DIR / package["name"])
+
     os.remove(tarball_path)
     TARBALL_DOWNLOADED_PACKAGES.add(package["name"])
 
-# 6. install the packages
+
+for package in lock_file_details:
+    if package["name"] not in TARBALL_DOWNLOADED_PACKAGES:
+        download_and_extract_package(package)
+
 print("Hardlinking packages")
 for package in lock_file_details:
     package_dir = STORE_DIR / package["name"]
@@ -204,21 +199,18 @@ for package in lock_file_details:
             if dest.exists():
                 dest.unlink()
             os.link(source, dest)
-
-# 7. symlink dependencies of each package to the node_modules directory's package directory
-print("Symlinking dependencies")
+print("Packages hardlinked successfully.")
 
 
+# 6. Install packages
 def create_symlink(source: Path, destination: Path):
-    # Ensure the destination directory exists
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
-        destination.unlink()  # Remove existing link or file if any
+        destination.unlink()
     os.symlink(source, destination)
 
 
 def symlink_dependencies(package_name: str, dependencies: dict):
-    # Each dependency is symlinked within the package's node_modules directory
     package_dir = NODE_MODULES_DIR / package_name
     for dep_name, dep_version in dependencies.items():
         source_path = NODE_MODULES_DIR / dep_name
@@ -237,4 +229,22 @@ def symlink_to_root(package_name: str):
 # Symlink root-level dependencies
 for package in lock_file_details:
     symlink_to_root(package["name"])
+    # symlink package to itself, to avoid edge case of package requiring itself
+    # create_symlink(
+    #     NODE_MODULES_DIR / package["name"],
+    #     NODE_MODULES_DIR / package["name"] / "node_modules" / package["name"],
+    # )
+
     symlink_dependencies(package["name"], package["dependencies"])
+
+print("Packages installed successfully.")
+
+
+# 7. Run postinstall scripts
+for package in lock_file_details:
+    package_dir = NODE_MODULES_DIR / package["name"]
+    postinstall_script = package_dir / "node_modules" / ".bin" / "postinstall"
+    if postinstall_script.exists():
+        print(f"Running postinstall script for {package['name']}")
+        os.system(f"cd {package_dir} && {postinstall_script}")
+print("Postinstall scripts run successfully.")

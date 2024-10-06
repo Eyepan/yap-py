@@ -215,14 +215,14 @@ def symlink_dependencies(package_name: str, dependencies: dict):
     for dep_name, dep_version in dependencies.items():
         source_path = NODE_MODULES_DIR / dep_name
         dest_path = package_dir / "node_modules" / dep_name
-        print(f"Symlinking {source_path} -> {dest_path}")
+        print(f"SYMLINKING {source_path} -> {dest_path}")
         create_symlink(source_path, dest_path)
 
 
 def symlink_to_root(package_name: str):
     source_path = NODE_MODULES_DIR / ".yap" / package_name
     dest_path = NODE_MODULES_DIR / package_name
-    print(f"Symlinking {source_path} -> {dest_path}")
+    print(f"SYMLINKING {source_path} -> {dest_path}")
     create_symlink(source_path, dest_path)
 
 
@@ -230,10 +230,10 @@ def symlink_to_root(package_name: str):
 for package in lock_file_details:
     symlink_to_root(package["name"])
     # symlink package to itself, to avoid edge case of package requiring itself
-    # create_symlink(
-    #     NODE_MODULES_DIR / package["name"],
-    #     NODE_MODULES_DIR / package["name"] / "node_modules" / package["name"],
-    # )
+    create_symlink(
+        NODE_MODULES_DIR / package["name"],
+        NODE_MODULES_DIR / package["name"] / "node_modules" / package["name"],
+    )
 
     symlink_dependencies(package["name"], package["dependencies"])
 

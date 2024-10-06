@@ -1,2 +1,8 @@
 node_modules/
 .venv/
+.yap_store/
+package.json
+*.bkp
+
+__pycache__/
+*.pyc

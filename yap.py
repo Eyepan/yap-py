@@ -15,11 +15,9 @@ import requests
 
 from errors import CacheError, MetadataError, NetworkError
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration setup
 CONFIG = {"registry": "https://registry.npmjs.org/"}
 METADATA_DOWNLOADED_PACKAGES = set()
 metadata_lock = threading.Lock()
@@ -44,7 +42,6 @@ def process_npmrc(file_path):
 if not CONFIG["registry"].endswith("/"):
     CONFIG["registry"] += "/"
 
-# Setup store and cache directories
 STORE_DIR = Path.home() / ".yap_store"
 CACHE_DIR = STORE_DIR / ".yap_cache"
 NODE_MODULES_DIR = Path.cwd() / "node_modules"
@@ -53,7 +50,6 @@ for path in [STORE_DIR, CACHE_DIR, NODE_MODULES_DIR]:
     path.mkdir(parents=True, exist_ok=True)
 
 
-# Cache management
 def set_to_metadata_cache(name: str, contents: any):
     cache_file = CACHE_DIR / name.replace("/", "_")
     try:
@@ -74,7 +70,6 @@ def get_from_metadata_cache(name: str):
     return None
 
 
-# HTTP session
 session = requests.Session()
 if "authToken" in CONFIG:
     session.headers["Authorization"] = f"Bearer {CONFIG['authToken']}"

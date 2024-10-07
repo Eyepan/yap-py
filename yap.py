@@ -152,7 +152,6 @@ def resolve_single_dependency(package_name, version, lock_file_details):
     with metadata_lock:
         if package_name in METADATA_DOWNLOADED_PACKAGES:
             return
-        METADATA_DOWNLOADED_PACKAGES.add(package_name)
 
     if version.startswith(("git+", "git:")):
         return
@@ -169,6 +168,10 @@ def resolve_single_dependency(package_name, version, lock_file_details):
             version = new_package_name.split("@")[1]
 
     package_metadata = fetch_package_metadata(package_name)
+
+    with metadata_lock:
+        METADATA_DOWNLOADED_PACKAGES.add(package_name)
+
     available_versions = package_metadata["versions"].keys()
     resolved_version = resolve_version(version, available_versions)
     if not resolved_version:

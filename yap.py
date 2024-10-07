@@ -45,7 +45,7 @@ if not CONFIG["registry"].endswith("/"):
     CONFIG["registry"] += "/"
 
 # Setup store and cache directories
-STORE_DIR = Path.cwd() / ".yap_store"
+STORE_DIR = Path.home() / ".yap_store"
 CACHE_DIR = STORE_DIR / ".yap_cache"
 NODE_MODULES_DIR = Path.cwd() / "node_modules"
 
@@ -202,11 +202,6 @@ def safe_package_details(package_str):
         package_name = package_str.split("@")[0]
         version = package_str.split("@")[1]
         return package_name, version
-
-
-import os
-import tarfile
-from pathlib import Path
 
 
 def download_and_extract_package(package):

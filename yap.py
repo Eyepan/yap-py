@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 CONFIG = {"registry": "https://registry.npmjs.org/"}
 METADATA_DOWNLOADED_PACKAGES = set()
 metadata_lock = threading.Lock()
+TARBALL_DOWNLOADED_PACKAGES = set()
+tarball_lock = threading.Lock()
 
 
 def process_npmrc(file_path):
@@ -152,6 +154,7 @@ def resolve_single_dependency(package_name, version, lock_file_details):
     with metadata_lock:
         if package_name in METADATA_DOWNLOADED_PACKAGES:
             return
+        METADATA_DOWNLOADED_PACKAGES.add(package_name)
 
     if version.startswith(("git+", "git:")):
         return
@@ -160,17 +163,9 @@ def resolve_single_dependency(package_name, version, lock_file_details):
 
     if version.startswith("npm:"):
         new_package_name = version[4:]
-        if new_package_name.startswith("@"):
-            package_name = f"@{new_package_name.split("@")[1]}"
-            version = new_package_name.split("@")[2]
-        else:
-            package_name = new_package_name.split("@")[0]
-            version = new_package_name.split("@")[1]
+        package_name, version = safe_package_details(new_package_name)
 
     package_metadata = fetch_package_metadata(package_name)
-
-    with metadata_lock:
-        METADATA_DOWNLOADED_PACKAGES.add(package_name)
 
     available_versions = package_metadata["versions"].keys()
     resolved_version = resolve_version(version, available_versions)
@@ -194,11 +189,40 @@ def resolve_single_dependency(package_name, version, lock_file_details):
     )
 
 
-def download_and_extract_package(package):
-    tarball_path = STORE_DIR / f"{package['name'].replace('/', '_')}.tgz"
+def safe_package_name(name: str):
+    return name.replace("/", "_")
 
-    if (STORE_DIR / package["name"]).exists():
-        logger.info(f"Package already exists: {package["name"]}")
+
+def safe_package_details(package_str):
+    if package_str.startswith("@"):
+        package_name = f"@{package_str.split("@")[1]}"
+        version = package_str.split("@")[2]
+        return package_name, version
+    else:
+        package_name = package_str.split("@")[0]
+        version = package_str.split("@")[1]
+        return package_name, version
+
+
+import os
+import tarfile
+from pathlib import Path
+
+
+def download_and_extract_package(package):
+    with tarball_lock:
+        if package["name"] in TARBALL_DOWNLOADED_PACKAGES:
+            return
+        TARBALL_DOWNLOADED_PACKAGES.add(package["name"])
+
+    tarball_path = (
+        STORE_DIR / f"{safe_package_name(package['name'])}@{package['version']}.tgz"
+    )
+    package_path = (
+        STORE_DIR / f"{safe_package_name(package['name'])}@{package['version']}"
+    )
+    if package_path.exists():
+        logger.info(f"Package already exists: {package['name']}")
         return
 
     logger.info(f"DOWNLOADING {package['name']}")
@@ -212,30 +236,37 @@ def download_and_extract_package(package):
         f.write(response.content)
 
     with tarfile.open(tarball_path, "r:gz") as tar:
-        tar.extractall(path=STORE_DIR / package["name"])
+        for member in tar.getmembers():
+            if member.name.startswith("package/"):
+                member.name = member.name[len("package/") :]
+                tar.extract(member, path=package_path)
 
     os.remove(tarball_path)
 
 
 def create_symlink(source: Path, destination: Path):
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
+    if destination.exists() or destination.is_file():
         destination.unlink()
     os.symlink(source, destination)
 
 
-def symlink_dependencies(package_name: str, dependencies: dict):
-    package_dir = NODE_MODULES_DIR / package_name
-    for dep_name, dep_version in dependencies.items():
+def symlink_dependencies(package):
+    package_dir = NODE_MODULES_DIR / package["name"]
+    for dep_name, dep_version in package["dependencies"].items():
         source_path = NODE_MODULES_DIR / dep_name
         dest_path = package_dir / "node_modules" / dep_name
         logger.info(f"SYMLINKING {source_path} -> {dest_path}")
         create_symlink(source_path, dest_path)
 
 
-def symlink_to_root(package_name: str):
-    source_path = NODE_MODULES_DIR / ".yap" / package_name
-    dest_path = NODE_MODULES_DIR / package_name
+def symlink_to_root(package):
+    source_path = (
+        NODE_MODULES_DIR
+        / ".yap"
+        / f"{safe_package_name(package['name'])}@{package['version']}"
+    )
+    dest_path = NODE_MODULES_DIR / package["name"]
     logger.info(f"SYMLINKING {source_path} -> {dest_path}")
     create_symlink(source_path, dest_path)
 
@@ -258,16 +289,25 @@ def main():
         dependencies = load_package_json(package_json_path)
         resolve_dependency_and_queue_urls(dependencies, lock_file_details)
         save_lock_file(lock_file_path, lock_file_details)
+        logger.info(f"Downloaded: {len(METADATA_DOWNLOADED_PACKAGES)} metadatas")
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         executor.map(download_and_extract_package, lock_file_details)
+    logger.info(
+        f"Downloaded and extracted: {len(TARBALL_DOWNLOADED_PACKAGES)} tarballs"
+    )
 
     logger.info("Hardlinking packages")
     for package in lock_file_details:
-        package_dir = STORE_DIR / package["name"]
-        target_package_dir = NODE_MODULES_DIR / ".yap" / package["name"]
+        package_dir = (
+            STORE_DIR / f"{safe_package_name(package['name'])}@{package['version']}"
+        )
+        target_package_dir = (
+            NODE_MODULES_DIR
+            / ".yap"
+            / f"{safe_package_name(package['name'])}@{package['version']}"
+        )
         target_package_dir.mkdir(parents=True, exist_ok=True)
-
         for root, dirs, files in os.walk(package_dir):
             for file in files:
                 source = Path(root) / file
@@ -279,12 +319,12 @@ def main():
     logger.info("Packages hardlinked successfully.")
 
     for package in lock_file_details:
-        symlink_to_root(package["name"])
+        symlink_to_root(package)
         create_symlink(
             NODE_MODULES_DIR / package["name"],
             NODE_MODULES_DIR / package["name"] / "node_modules" / package["name"],
         )
-        symlink_dependencies(package["name"], package["dependencies"])
+        symlink_dependencies(package)
 
     logger.info("Packages installed successfully.")
     run_postinstall_scripts(lock_file_details)

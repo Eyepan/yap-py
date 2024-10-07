@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
 import json
+import logging
 import os
 import pickle
 import tarfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -11,11 +14,14 @@ import requests
 from errors import CacheError, MetadataError, NetworkError
 from resolver import resolve_version
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# 0. Configuration setup
+# Configuration setup
 CONFIG = {"registry": "https://registry.npmjs.org/"}
 METADATA_DOWNLOADED_PACKAGES = set()
-TARBALL_DOWNLOADED_PACKAGES = set()
+metadata_lock = threading.Lock()
 
 
 def process_npmrc(file_path):
@@ -34,7 +40,6 @@ def process_npmrc(file_path):
 
 if not CONFIG["registry"].endswith("/"):
     CONFIG["registry"] += "/"
-
 
 # Setup store and cache directories
 STORE_DIR = Path.cwd() / ".yap_store"
@@ -95,76 +100,85 @@ def fetch_package_metadata(name: str) -> dict:
         raise MetadataError(f"Error parsing JSON from {package_url}: {e}")
 
 
-# 1. Check for existing lockfile
-lock_file = Path.cwd() / "yap.lock"
-if lock_file.exists():
-    print("Lockfile found, skipping resolution")
-    with lock_file.open("rb") as f:
-        lock_file_details = pickle.load(f)
-else:
-    lock_file_details = []
-    package_json = Path.cwd() / "package.json"
-    if not package_json.exists():
-        print("package.json not found")
-        exit(1)
+def load_lock_file(lock_file_path):
+    if lock_file_path.exists():
+        logger.info("Lockfile found, skipping resolution")
+        with lock_file_path.open("rb") as f:
+            return pickle.load(f)
+    return []
 
-    # Load package.json dependencies
-    with package_json.open("r") as f:
+
+def save_lock_file(lock_file_path, lock_file_details):
+    with lock_file_path.open("wb") as f:
+        pickle.dump(lock_file_details, f)
+
+
+def load_package_json(package_json_path):
+    if not package_json_path.exists():
+        logger.error("package.json not found")
+        exit(1)
+    with package_json_path.open("r") as f:
         data = json.load(f)
-        dependencies = {
+        return {
             **data.get("dependencies", {}),
             **data.get("devDependencies", {}),
             **data.get("peerDependencies", {}),
         }
 
-    # Resolve dependencies and download metadata
-    def resolve_dependency_and_queue_urls(dependencies):
+
+def resolve_dependency_and_queue_urls(dependencies, lock_file_details):
+    futures = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
         for package_name, version in dependencies.items():
-            if package_name in METADATA_DOWNLOADED_PACKAGES:
-                continue
-            print(f"RESOLVING: {package_name} {version}")
-            package_metadata = fetch_package_metadata(package_name)
-            METADATA_DOWNLOADED_PACKAGES.add(package_name)
-
-            # 3.5 Resolve version
-            if version.startswith(("git+", "npm:", "git:")):
-                continue
-            available_versions = package_metadata["versions"].keys()
-            resolved_version = resolve_version(version, available_versions)
-            if not resolved_version:
-                raise MetadataError(
-                    f"Could not resolve version for {package_name} {version}"
+            futures.append(
+                executor.submit(
+                    resolve_single_dependency, package_name, version, lock_file_details
                 )
-            package_metadata = package_metadata["versions"][resolved_version]
-
-            # 4. Resolve dependencies recursively
-            resolve_dependency_and_queue_urls(package_metadata.get("dependencies", {}))
-
-            tarball_url = package_metadata["dist"]["tarball"]
-            lock_file_details.append(
-                {
-                    "url": tarball_url,
-                    "name": package_name,
-                    "version": resolved_version,
-                    "dependencies": package_metadata.get("dependencies", {}),
-                }
             )
-
-    resolve_dependency_and_queue_urls(dependencies)
-
-    # Save lockfile
-    with lock_file.open("wb") as f:
-        pickle.dump(lock_file_details, f)
+        for future in futures:
+            future.result()
 
 
-# 5. Download and extract packages
+def resolve_single_dependency(package_name, version, lock_file_details):
+    with metadata_lock:
+        if package_name in METADATA_DOWNLOADED_PACKAGES:
+            return
+        METADATA_DOWNLOADED_PACKAGES.add(package_name)
+
+    logger.info(f"RESOLVING: {package_name} {version}")
+    package_metadata = fetch_package_metadata(package_name)
+
+    if version.startswith(("git+", "npm:", "git:")):
+        return
+    available_versions = package_metadata["versions"].keys()
+    resolved_version = resolve_version(version, available_versions)
+    if not resolved_version:
+        raise MetadataError(f"Could not resolve version for {package_name} {version}")
+    package_metadata = package_metadata["versions"][resolved_version]
+
+    resolve_dependency_and_queue_urls(
+        package_metadata.get("dependencies", {}), lock_file_details
+    )
+
+    tarball_url = package_metadata["dist"]["tarball"]
+    lock_file_details.append(
+        {
+            "url": tarball_url,
+            "name": package_name,
+            "version": resolved_version,
+            "dependencies": package_metadata.get("dependencies", {}),
+        }
+    )
+
+
 def download_and_extract_package(package):
     tarball_path = STORE_DIR / f"{package['name'].replace('/', '_')}.tgz"
+
     if (STORE_DIR / package["name"]).exists():
-        print("Package already exists", package["name"])
+        logger.info(f"Package already exists: {package["name"]}")
         return
 
-    print(f"Downloading {package['name']}")
+    logger.info(f"DOWNLOADING {package['name']}")
     response = session.get(package["url"])
     if response.status_code != 200:
         raise NetworkError(
@@ -178,31 +192,8 @@ def download_and_extract_package(package):
         tar.extractall(path=STORE_DIR / package["name"])
 
     os.remove(tarball_path)
-    TARBALL_DOWNLOADED_PACKAGES.add(package["name"])
 
 
-for package in lock_file_details:
-    if package["name"] not in TARBALL_DOWNLOADED_PACKAGES:
-        download_and_extract_package(package)
-
-print("Hardlinking packages")
-for package in lock_file_details:
-    package_dir = STORE_DIR / package["name"]
-    target_package_dir = NODE_MODULES_DIR / ".yap" / package["name"]
-    target_package_dir.mkdir(parents=True, exist_ok=True)
-
-    for root, dirs, files in os.walk(package_dir):
-        for file in files:
-            source = Path(root) / file
-            dest = target_package_dir / source.relative_to(package_dir)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
-                dest.unlink()
-            os.link(source, dest)
-print("Packages hardlinked successfully.")
-
-
-# 6. Install packages
 def create_symlink(source: Path, destination: Path):
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
@@ -215,36 +206,67 @@ def symlink_dependencies(package_name: str, dependencies: dict):
     for dep_name, dep_version in dependencies.items():
         source_path = NODE_MODULES_DIR / dep_name
         dest_path = package_dir / "node_modules" / dep_name
-        print(f"SYMLINKING {source_path} -> {dest_path}")
+        logger.info(f"SYMLINKING {source_path} -> {dest_path}")
         create_symlink(source_path, dest_path)
 
 
 def symlink_to_root(package_name: str):
     source_path = NODE_MODULES_DIR / ".yap" / package_name
     dest_path = NODE_MODULES_DIR / package_name
-    print(f"SYMLINKING {source_path} -> {dest_path}")
+    logger.info(f"SYMLINKING {source_path} -> {dest_path}")
     create_symlink(source_path, dest_path)
 
 
-# Symlink root-level dependencies
-for package in lock_file_details:
-    symlink_to_root(package["name"])
-    # symlink package to itself, to avoid edge case of package requiring itself
-    create_symlink(
-        NODE_MODULES_DIR / package["name"],
-        NODE_MODULES_DIR / package["name"] / "node_modules" / package["name"],
-    )
-
-    symlink_dependencies(package["name"], package["dependencies"])
-
-print("Packages installed successfully.")
+def run_postinstall_scripts(lock_file_details):
+    for package in lock_file_details:
+        package_dir = NODE_MODULES_DIR / package["name"]
+        postinstall_script = package_dir / "node_modules" / ".bin" / "postinstall"
+        if postinstall_script.exists():
+            logger.info(f"Running postinstall script for {package['name']}")
+            os.system(f"cd {package_dir} && {postinstall_script}")
 
 
-# 7. Run postinstall scripts
-for package in lock_file_details:
-    package_dir = NODE_MODULES_DIR / package["name"]
-    postinstall_script = package_dir / "node_modules" / ".bin" / "postinstall"
-    if postinstall_script.exists():
-        print(f"Running postinstall script for {package['name']}")
-        os.system(f"cd {package_dir} && {postinstall_script}")
-print("Postinstall scripts run successfully.")
+def main():
+    lock_file_path = Path.cwd() / "yap.lock"
+    lock_file_details = load_lock_file(lock_file_path)
+
+    if not lock_file_details:
+        package_json_path = Path.cwd() / "package.json"
+        dependencies = load_package_json(package_json_path)
+        resolve_dependency_and_queue_urls(dependencies, lock_file_details)
+        save_lock_file(lock_file_path, lock_file_details)
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        executor.map(download_and_extract_package, lock_file_details)
+
+    logger.info("Hardlinking packages")
+    for package in lock_file_details:
+        package_dir = STORE_DIR / package["name"]
+        target_package_dir = NODE_MODULES_DIR / ".yap" / package["name"]
+        target_package_dir.mkdir(parents=True, exist_ok=True)
+
+        for root, dirs, files in os.walk(package_dir):
+            for file in files:
+                source = Path(root) / file
+                dest = target_package_dir / source.relative_to(package_dir)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.exists():
+                    dest.unlink()
+                os.link(source, dest)
+    logger.info("Packages hardlinked successfully.")
+
+    for package in lock_file_details:
+        symlink_to_root(package["name"])
+        create_symlink(
+            NODE_MODULES_DIR / package["name"],
+            NODE_MODULES_DIR / package["name"] / "node_modules" / package["name"],
+        )
+        symlink_dependencies(package["name"], package["dependencies"])
+
+    logger.info("Packages installed successfully.")
+    run_postinstall_scripts(lock_file_details)
+    logger.info("Postinstall scripts run successfully.")
+
+
+if __name__ == "__main__":
+    main()

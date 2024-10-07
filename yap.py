@@ -9,10 +9,11 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import semantic_version
+
 import requests
 
 from errors import CacheError, MetadataError, NetworkError
-from resolver import resolve_version
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -139,34 +140,53 @@ def resolve_dependency_and_queue_urls(dependencies, lock_file_details):
             future.result()
 
 
+def resolve_version(wanted_version: str, available_versions):
+    wanted = semantic_version.NpmSpec(wanted_version)
+    selected_version = wanted.select(
+        [semantic_version.Version(v) for v in available_versions]
+    )
+    return selected_version.__str__()
+
+
 def resolve_single_dependency(package_name, version, lock_file_details):
     with metadata_lock:
         if package_name in METADATA_DOWNLOADED_PACKAGES:
             return
         METADATA_DOWNLOADED_PACKAGES.add(package_name)
 
-    logger.info(f"RESOLVING: {package_name} {version}")
-    package_metadata = fetch_package_metadata(package_name)
-
-    if version.startswith(("git+", "npm:", "git:")):
+    if version.startswith(("git+", "git:")):
         return
+
+    logger.info(f"RESOLVING: {package_name} {version}")
+
+    if version.startswith("npm:"):
+        new_package_name = version[4:]
+        if new_package_name.startswith("@"):
+            package_name = f"@{new_package_name.split("@")[1]}"
+            version = new_package_name.split("@")[2]
+        else:
+            package_name = new_package_name.split("@")[0]
+            version = new_package_name.split("@")[1]
+
+    package_metadata = fetch_package_metadata(package_name)
     available_versions = package_metadata["versions"].keys()
     resolved_version = resolve_version(version, available_versions)
     if not resolved_version:
         raise MetadataError(f"Could not resolve version for {package_name} {version}")
-    package_metadata = package_metadata["versions"][resolved_version]
+    version_metadata = package_metadata["versions"][resolved_version]
+    version_metadata["name"] = package_name
 
     resolve_dependency_and_queue_urls(
-        package_metadata.get("dependencies", {}), lock_file_details
+        version_metadata.get("dependencies", {}), lock_file_details
     )
 
-    tarball_url = package_metadata["dist"]["tarball"]
+    tarball_url = version_metadata["dist"]["tarball"]
     lock_file_details.append(
         {
             "url": tarball_url,
             "name": package_name,
             "version": resolved_version,
-            "dependencies": package_metadata.get("dependencies", {}),
+            "dependencies": version_metadata.get("dependencies", {}),
         }
     )
 
